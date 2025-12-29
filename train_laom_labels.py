@@ -1,11 +1,18 @@
 import math
+import os
 import time
 import uuid
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Optional
 
+import cv2
+import gymnasium as gym
+import h5py
+import imageio.v3 as iio
 import numpy as np
+from dm_control import suite
+from shimmy import DmControlCompatibilityV0
 import pyrallis
 import torch
 import torch.nn as nn
@@ -36,6 +43,128 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def draw_reward_text(frame, reward, avg_reward):
+    """Draw reward info on top-right of frame."""
+    frame = frame.copy()
+    text1 = f"Current reward: {reward:.3f}"
+    text2 = f"Average reward: {avg_reward:.3f}"
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.4
+    thickness = 1
+    color = (255, 255, 255)
+    bg_color = (0, 0, 0)
+
+    (w1, h1), _ = cv2.getTextSize(text1, font, font_scale, thickness)
+    (w2, h2), _ = cv2.getTextSize(text2, font, font_scale, thickness)
+
+    padding = 4
+    x1 = frame.shape[1] - max(w1, w2) - padding - 2
+    y1 = padding + h1
+    y2 = y1 + h2 + padding
+
+    cv2.rectangle(frame, (x1 - 2, y1 - h1 - 2), (x1 + w1 + 2, y1 + 2), bg_color, -1)
+    cv2.rectangle(frame, (x1 - 2, y2 - h2 - 2), (x1 + w2 + 2, y2 + 2), bg_color, -1)
+    cv2.putText(frame, text1, (x1, y1), font, font_scale, color, thickness)
+    cv2.putText(frame, text2, (x1, y2), font, font_scale, color, thickness)
+
+    return frame
+
+
+def make_render_env(domain, task, render_size=64, frame_stack=3):
+    """Create a DMControl environment with pixel observations for rendering."""
+    from dm_control.suite.wrappers import pixels
+    from src.utils import FlattenStackedFrames, SelectPixelsObsWrapper
+
+    dm_env = suite.load(domain_name=domain, task_name=task)
+    dm_env = pixels.Wrapper(
+        dm_env,
+        pixels_only=True,
+        render_kwargs=dict(height=render_size, width=render_size, camera_id=0),
+    )
+    env = DmControlCompatibilityV0(
+        dm_env,
+        render_mode="rgb_array",
+        render_kwargs=dict(height=render_size, width=render_size, camera_id=0),
+    )
+    env = gym.wrappers.ClipAction(env)
+    env = SelectPixelsObsWrapper(env)
+
+    if frame_stack > 1:
+        env = gym.wrappers.FrameStackObservation(env, stack_size=frame_stack)
+        env = FlattenStackedFrames(env)
+
+    return env
+
+
+@torch.no_grad()
+def render_rollout(
+    actor,
+    action_decoder,
+    domain,
+    task,
+    output_path,
+    duration=30.0,
+    fps=30,
+    render_size=256,
+    frame_stack=3,
+    seed=0,
+    device=DEVICE,
+):
+    """Render a rollout to MP4 with reward overlay."""
+    env = make_render_env(domain, task, render_size, frame_stack)
+    max_frames = int(duration * fps)
+    images = []
+    total_reward = 0.0
+    step_count = 0
+
+    obs, _ = env.reset(seed=seed)
+    images.append(env.render())
+
+    actor.eval()
+    action_decoder.eval()
+
+    while len(images) <= max_frames:
+        # obs shape: (H, W, C*stack), need (B, C*stack, H, W)
+        obs_tensor = torch.tensor(obs, device=device, dtype=torch.float32)
+        obs_tensor = obs_tensor.permute(2, 0, 1).unsqueeze(0)  # (H,W,C) -> (C,H,W) -> (1,C,H,W)
+        obs_tensor = normalize_img(obs_tensor)
+
+        latent_action, obs_emb = actor(obs_tensor)
+        action = action_decoder(obs_emb, latent_action)
+        action_np = action.squeeze().cpu().numpy()
+
+        obs, reward, terminated, truncated, _ = env.step(action_np)
+        total_reward += reward
+        step_count += 1
+
+        images.append(env.render())
+
+        if terminated or truncated:
+            total_reward = 0.0
+            step_count = 0
+            obs, _ = env.reset(seed=seed + step_count)
+
+    env.close()
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    iio.imwrite(output_path, np.array(images), fps=fps)
+    print(f"Saved rollout video to {output_path}")
+
+
+def save_checkpoint(actor, action_decoder, epoch, output_dir):
+    """Save actor and action_decoder checkpoints."""
+    os.makedirs(output_dir, exist_ok=True)
+    checkpoint = {
+        "actor": actor.state_dict(),
+        "action_decoder": action_decoder.state_dict(),
+        "epoch": epoch,
+    }
+    path = os.path.join(output_dir, f"checkpoint_epoch_{epoch}.pt")
+    torch.save(checkpoint, path)
+    print(f"Saved checkpoint to {path}")
 
 
 @dataclass
@@ -497,7 +626,7 @@ def train_bc(lam: LAOMWithLabels, config: BCConfig):
     return actor
 
 
-def train_act_decoder(actor: Actor, config: DecoderConfig, bc_config: BCConfig):
+def train_act_decoder(actor: Actor, config: DecoderConfig, bc_config: BCConfig, checkpoint_interval: int = 250):
     for p in actor.parameters():
         p.requires_grad_(False)
     actor.eval()
@@ -510,6 +639,13 @@ def train_act_decoder(actor: Actor, config: DecoderConfig, bc_config: BCConfig):
     )
     # to make equal number of updates for all labeled datasets which vary in size
     num_epochs = config.total_updates // len(dataloader)
+
+    # Read domain/task/img_hw from HDF5 for rendering
+    with h5py.File(config.data_path, "r") as df:
+        domain_name = df.attrs["domain_name"]
+        task_name = df.attrs["task_name"]
+        img_hw = df.attrs["img_hw"]
+    print(f"Domain: {domain_name}, Task: {task_name}, img_hw: {img_hw}")
 
     action_decoder = ActionDecoder(
         obs_emb_dim=math.prod(actor.final_encoder_shape),
@@ -542,7 +678,27 @@ def train_act_decoder(actor: Actor, config: DecoderConfig, bc_config: BCConfig):
     total_tokens = 0
     total_steps = 0
 
+    # Output directory for checkpoints and videos
+    output_dir = f"out/decoder-{domain_name}-{task_name}"
+
     for epoch in trange(num_epochs, desc="Epochs"):
+        # Checkpoint and render at epoch 0 and every checkpoint_interval epochs
+        if epoch == 0 or epoch % checkpoint_interval == 0:
+            save_checkpoint(actor, action_decoder, epoch, output_dir)
+            video_path = os.path.join(output_dir, f"rollout_epoch_{epoch}.mp4")
+            render_rollout(
+                actor=actor,
+                action_decoder=action_decoder,
+                domain=domain_name,
+                task=task_name,
+                output_path=video_path,
+                duration=30.0,
+                fps=30,
+                render_size=img_hw,
+                frame_stack=bc_config.frame_stack,
+                device=DEVICE,
+            )
+
         for batch in dataloader:
             total_tokens += config.batch_size
             total_steps += 1
@@ -576,6 +732,22 @@ def train_act_decoder(actor: Actor, config: DecoderConfig, bc_config: BCConfig):
                     "decoder/total_steps": total_steps,
                 }
             )
+
+    # Save final checkpoint
+    save_checkpoint(actor, action_decoder, num_epochs, output_dir)
+    video_path = os.path.join(output_dir, f"rollout_epoch_{num_epochs}_final.mp4")
+    render_rollout(
+        actor=actor,
+        action_decoder=action_decoder,
+        domain=domain_name,
+        task=task_name,
+        output_path=video_path,
+        duration=30.0,
+        fps=30,
+        render_size=img_hw,
+        frame_stack=bc_config.frame_stack,
+        device=DEVICE,
+    )
 
     actor.eval()
     eval_returns = evaluate_bc(
