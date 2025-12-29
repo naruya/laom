@@ -170,3 +170,4 @@ ipynb_checkpoints
 **/**/.ipynb_checkpoints
 notebooks
 .ruff_cache
+.vscode
