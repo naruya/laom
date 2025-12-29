@@ -8,6 +8,23 @@ Official implementation of the [**Latent Action Learning Requires Supervision in
 
 <img src="images/final_result_comb.jpg" alt="Environments" width="1000">
 
+## Setup instructions by naruya
+
+Using [uv](https://docs.astral.sh/uv/) (Python 3.9):
+
+```bash
+# Install system dependencies (Ubuntu)
+apt install -y libegl1-mesa libegl1-mesa-dev
+
+# Sync environment
+uv sync
+
+# Run with MUJOCO_GL=egl for headless rendering
+MUJOCO_GL=egl uv run python render_expert.py --task hopper-hop --duration 5
+
+# Available tasks: hopper-hop, walker-run, cheetah-run
+```
+
 ## Setup instructions
 
 To set up python environment (with dev-tools of your taste, in our workflow we used conda and python 3.11), just install all the requirements:

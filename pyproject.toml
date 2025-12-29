@@ -1,3 +1,29 @@
+[project]
+name = "laom"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.9, <3.10"
+dependencies = [
+    "dm-control>=1.0.21.post1",
+    "gymnasium>=1.1.1",
+    "h5py==3.10.0",
+    "imageio>=2.37.2",
+    "imageio-ffmpeg>=0.6.0",
+    "mujoco==3.2.0",
+    "numpy==1.26.4",
+    "opencv-python>=4.11.0.86",
+    "pillow>=11.3.0",
+    "pyrallis==0.3.1",
+    "sb3-contrib==2.4.0",
+    "shimmy==2.0.0",
+    "stable-baselines3>=2.7.1",
+    "torcheval>=0.0.7",
+    "torchinfo>=1.8.0",
+    "torchvision>=0.23.0",
+    "tqdm>=4.67.1",
+    "vector-quantize-pytorch==1.22.16",
+    "wandb==0.19.9",
+]
 [tool.ruff]
 line-length = 120
 target-version = "py312"
